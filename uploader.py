@@ -10,11 +10,17 @@ if sys.version > '3.':
     sys.exit(sys.stderr.write('Please run uploader.py by python2\n'))
 
 os.chdir(os.path.abspath(os.path.dirname(__file__)))
+GAE_DIR = os.getenv('GAE_DIR') or 'gae'
+CACHE_DIR = 'cache'
 
 import re
 import socket
+import traceback
+import shutil
+import functools
 import ssl
 import mimetypes
+import multiprocessing.pool
 
 mimetypes._winreg = None
 
@@ -102,6 +108,11 @@ from google_appengine.google.appengine.tools import appcfg
 
 def upload(dirname, appid):
     assert isinstance(dirname, basestring) and isinstance(appid, basestring)
+    oldname = dirname
+    dirname = '%s/%s-%s' % (CACHE_DIR, dirname, appid)
+    if os.path.isdir(dirname):
+        shutil.rmtree(dirname, ignore_errors=True)
+    shutil.copytree(oldname, dirname)
     filename = os.path.join(dirname, 'app.yaml')
     with open(filename, 'rb') as fp:
         content = fp.read()
@@ -113,6 +124,14 @@ def upload(dirname, appid):
     else:
         appcfg.main(['appcfg', 'rollback', '--noauth_local_webserver', dirname])
         appcfg.main(['appcfg', 'update', '--noauth_local_webserver', dirname])
+
+def retry_upload(max_retries, dirname, appid):
+    for _ in xrange(max_retries):
+        try:
+            upload(dirname, appid)
+            break
+        except (Exception, SystemExit) as e:
+            println(u'=====上传 APPID(%r) 失败，重试中...=====' % appid)
 
 def input_appids():
     while True:
@@ -132,18 +151,27 @@ def main():
     clear()
     println(u'''\
 ===============================================================
- GoProxy 服务端部署程序, 开始上传 gae 应用文件夹
+ GoProxy 服务端部署程序, 开始上传 %s 应用文件夹
  Linux/Mac 用户, 请使用 python uploader.py 来上传应用
 ===============================================================
 
 请输入您的appid, 多个appid请用|号隔开
 特别提醒：appid 请勿包含 ID/Email 等个人信息！
-        '''.strip())
-    for appid in input_appids():
-        upload('gae', appid)
-    println(os.linesep + u'上传成功，请不要忘记编辑 gae.user.json 把你的appid填进去，谢谢。按回车键退出程序。')
+        '''.strip() % GAE_DIR)
+    if not os.path.isdir(CACHE_DIR):
+        os.mkdir(CACHE_DIR)
+    appids = input_appids()
+    retry_upload(4, GAE_DIR, appids[0])
+    pool = multiprocessing.pool.ThreadPool(processes=50)
+    pool.map(functools.partial(retry_upload, 4, GAE_DIR), appids[1:])
+    shutil.rmtree(CACHE_DIR, ignore_errors=True)
+    println(os.linesep + u'上传完毕，请检查 http://<appid>.appspot.com 的版本，谢谢。按回车键退出程序。')
     raw_input()
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except:
+        traceback.print_exc()
+        raw_input()
