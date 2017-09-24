@@ -2,6 +2,8 @@
 	"AppIDs": [
 		"goagenta"
 	],
+	"CustomDomains": [
+	],
 	"Password": "",
 	"SSLVerify": false,
 	"DisableIPv6": false,
@@ -22,7 +24,7 @@
 		],
 		"google_cn": [
 			"www.g.cn",
-			"www.google.cn"
+			"www.google.cn",
 		]
 	},
 	"SiteToAlias": {
@@ -55,6 +57,7 @@
 		// "*.youtube.com": "google_hk",
 	},
 	"ForceGAE": [
+		// "*.drive.google.com",
 		"appengine.google.com",
 		"books.google.com",
 		"business.google.com",
@@ -68,6 +71,8 @@
 		"www.google.com/maps",
 		"www.google.com/patents",
 		"youtube.googleapis.com",
+	],
+	"ForceBrotli": [
 	],
 	"TLSConfig": {
 		"Version": "TLSv1.2",
@@ -95,6 +100,7 @@
 		],
 	},
 	"GoogleG2PKP": "7HIpactkIAq2Y49orFOOQKurWxmmSFZhBCoQYcRhJ3Y=",
+	"GoogleG3PKP": "f8NnEFZxQ4ExFOhSN7EiFWtiudZQVD2oY60uauV/n78=",
 	"FakeOptions": {
 		"*": [
 			"Access-Control-Allow-Credentials: true",
@@ -135,14 +141,13 @@
 			"SocketReadBuffer": 0,
 			"DualStack": false,
 			"KeepAlive": 5,
-			"Level": 8,
+			"Level": 20,
 			"Timeout": 5,
 		},
 		"Proxy": {
 			"Enabled": false,
 			"URL": "socks5://127.0.0.1:1080",
 		},
-		"DisableCompression": false,
 		"DisableKeepAlives": false,
 		"IdleConnTimeout": 5,
 		"MaxIdleConnsPerHost": 32,

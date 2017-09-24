@@ -2,6 +2,7 @@ package gae
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io/ioutil"
 	"net"
@@ -48,6 +49,10 @@ func (b *QuicBody) OnError(err error) {
 
 func (t *Transport) roundTripQuic(req *http.Request) (*http.Response, error) {
 	t1 := t.RoundTripper.(*h2quic.RoundTripper)
+
+	if !strings.HasSuffix(req.Host, ".appspot.com") {
+		req = req.WithContext(context.WithValue(req.Context(), "ResponseHeaderTimeout", 8*time.Second))
+	}
 
 	resp, err := t1.RoundTripOpt(req, h2quic.RoundTripOpt{OnlyCachedConn: true})
 
@@ -107,20 +112,29 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 	_, isQuic := t.RoundTripper.(*h2quic.RoundTripper)
 
-	for i := 0; i < t.RetryTimes; i++ {
-		if i > 0 {
-			glog.Warningf("GAE %T.RoundTrip(retry=%d) for %#v", t.RoundTripper, i, req.URL.String())
-		}
+	retry := t.RetryTimes
+	if req.Method != http.MethodGet && req.Header.Get("Content-Length") != "" {
+		retry = 1
+	}
 
+	for i := 0; i < retry; i++ {
 		if isQuic {
 			resp, err = t.roundTripQuic(req)
 		} else {
 			resp, err = t.roundTripTLS(req)
 		}
 
-		if err == nil {
-			break
+		if err != nil {
+			glog.Warningf("GAE %T.RoundTrip(%#v) error: %+v", t.RoundTripper, req.URL.String(), err)
+			continue
 		}
+
+		if resp != nil && resp.StatusCode == http.StatusBadRequest {
+			glog.Warningf("GAE %T.RoundTrip(%#v) get HTTP Error %d", t.RoundTripper, req.URL.String(), resp.StatusCode)
+			continue
+		}
+
+		break
 	}
 
 	if resp != nil && resp.StatusCode >= http.StatusBadRequest {
@@ -136,7 +150,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 				switch {
 				case resp.StatusCode == http.StatusBadGateway && bytes.Contains(body, []byte("Please try again in 30 seconds.")):
 					duration = 1 * time.Hour
-				case resp.StatusCode >= 301 && strings.Contains(resp.Header.Get("Location"), "hangouts.google.com"):
+				case resp.StatusCode >= 301 && resp.Header.Get("Location") != "":
 					duration = 2 * time.Hour
 				case resp.StatusCode == http.StatusNotFound && bytes.Contains(body, []byte("<ins>That’s all we know.</ins>")):
 					server := resp.Header.Get("Server")
@@ -166,6 +180,7 @@ type GAETransport struct {
 	Transport   *Transport
 	MultiDialer *helpers.MultiDialer
 	Servers     *Servers
+	BrotliSites *helpers.HostMatcher
 	Deadline    time.Duration
 	RetryDelay  time.Duration
 	RetryTimes  int
@@ -173,11 +188,12 @@ type GAETransport struct {
 
 func (t *GAETransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	deadline := t.Deadline
+	brotli := t.BrotliSites.Match(req.Host) && strings.Contains(req.Header.Get("Accept-Encoding"), "br")
 	retryTimes := t.RetryTimes
 	retryDelay := t.RetryDelay
 	for i := 0; i < retryTimes; i++ {
 		server := t.Servers.PickFetchServer(req, i)
-		req1, err := t.Servers.EncodeRequest(req, server, deadline)
+		req1, err := t.Servers.EncodeRequest(req, server, deadline, brotli)
 		if err != nil {
 			return nil, fmt.Errorf("GAE EncodeRequest: %s", err.Error())
 		}

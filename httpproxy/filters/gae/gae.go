@@ -1,8 +1,11 @@
 package gae
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"flag"
 	"math/rand"
@@ -13,6 +16,7 @@ import (
 	"time"
 
 	"github.com/cloudflare/golibs/lrucache"
+	"github.com/dsnet/compress/brotli"
 	"github.com/phuslu/glog"
 	"github.com/phuslu/net/http2"
 	quic "github.com/phuslu/quic-go"
@@ -30,6 +34,7 @@ const (
 
 type Config struct {
 	AppIDs          []string
+	CustomDomains   []string
 	Password        string
 	SSLVerify       bool
 	DisableIPv6     bool
@@ -50,7 +55,9 @@ type Config struct {
 		ServerName             []string
 	}
 	GoogleG2PKP string
+	GoogleG3PKP string
 	ForceGAE    []string
+	ForceBrotli []string
 	FakeOptions map[string][]string
 	DNSServers  []string
 	IPBlackList []string
@@ -68,7 +75,6 @@ type Config struct {
 			Enabled bool
 			URL     string
 		}
-		DisableCompression    bool
 		DisableKeepAlives     bool
 		IdleConnTimeout       int
 		MaxIdleConnsPerHost   int
@@ -86,6 +92,7 @@ type Filter struct {
 	ForceGAEStrings    []string
 	ForceGAESuffixs    []string
 	ForceGAEMatcher    *helpers.HostMatcher
+	ForceBrotliMatcher *helpers.HostMatcher
 	FakeOptionsMatcher *helpers.HostMatcher
 	SiteMatcher        *helpers.HostMatcher
 	DirectSiteMatcher  *helpers.HostMatcher
@@ -111,9 +118,20 @@ func NewFilter(config *Config) (filters.Filter, error) {
 		}
 	}
 
-	GoogleG2PKP, err := base64.StdEncoding.DecodeString(config.GoogleG2PKP)
+	g2pkp, err := base64.StdEncoding.DecodeString(config.GoogleG2PKP)
 	if err != nil {
 		return nil, err
+	}
+
+	g3pkp, err := base64.StdEncoding.DecodeString(config.GoogleG3PKP)
+	if err != nil {
+		return nil, err
+	}
+
+	googleValidator := func(cert *x509.Certificate) bool {
+		pkp := sha256.Sum256(cert.RawSubjectPublicKeyInfo)
+		return bytes.Equal(pkp[:], g2pkp) ||
+			bytes.Equal(pkp[:], g3pkp)
 	}
 
 	googleTLSConfig := &tls.Config{
@@ -136,22 +154,23 @@ func NewFilter(config *Config) (filters.Filter, error) {
 			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
 		},
 	}
-	switch config.TLSConfig.Version {
-	case "TLSv13", "TLSv1.3":
-		googleTLSConfig.MinVersion = tls.VersionTLS13
-	default:
+	if v := helpers.TLSVersion(config.TLSConfig.Version); v != 0 {
+		googleTLSConfig.MinVersion = v
+	} else {
 		googleTLSConfig.MinVersion = tls.VersionTLS12
 	}
 	pickupCiphers := func(names []string) []uint16 {
 		ciphers := make([]uint16, 0)
 		for _, name := range names {
-			cipher := helpers.Cipher(name)
+			cipher := helpers.TLSCipher(name)
 			if cipher == 0 {
 				glog.Fatalf("GAE: cipher %#v is not supported.", name)
 			}
 			ciphers = append(ciphers, cipher)
 		}
-		helpers.ShuffleUint16s(ciphers)
+		rand.Shuffle(len(ciphers), func(i int, j int) {
+			ciphers[i], ciphers[j] = ciphers[j], ciphers[i]
+		})
 		return ciphers
 	}
 	googleTLSConfig.CipherSuites = pickupCiphers(config.TLSConfig.Ciphers)
@@ -173,7 +192,9 @@ func NewFilter(config *Config) (filters.Filter, error) {
 	hostmap := map[string][]string{}
 	for key, value := range config.HostMap {
 		hosts := helpers.UniqueStrings(value)
-		helpers.ShuffleStrings(hosts)
+		rand.Shuffle(len(hosts), func(i int, j int) {
+			hosts[i], hosts[j] = hosts[j], hosts[i]
+		})
 		hostmap[key] = hosts
 	}
 
@@ -203,7 +224,7 @@ func NewFilter(config *Config) (filters.Filter, error) {
 		IPBlackList:       lrucache.NewLRUCache(1024),
 		HostMap:           hostmap,
 		GoogleTLSConfig:   googleTLSConfig,
-		GoogleG2PKP:       GoogleG2PKP,
+		GoogleValidator:   googleValidator,
 		TLSConnDuration:   lrucache.NewLRUCache(8192),
 		TLSConnError:      lrucache.NewLRUCache(8192),
 		TLSConnReadBuffer: config.Transport.Dialer.SocketReadBuffer,
@@ -240,7 +261,7 @@ func NewFilter(config *Config) (filters.Filter, error) {
 	t1 := &http.Transport{
 		DialTLS:               md.DialTLS,
 		DisableKeepAlives:     config.Transport.DisableKeepAlives,
-		DisableCompression:    config.Transport.DisableCompression,
+		DisableCompression:    true,
 		ResponseHeaderTimeout: time.Duration(config.Transport.ResponseHeaderTimeout) * time.Second,
 		IdleConnTimeout:       time.Duration(config.Transport.IdleConnTimeout) * time.Second,
 		MaxIdleConnsPerHost:   config.Transport.MaxIdleConnsPerHost,
@@ -285,7 +306,8 @@ func NewFilter(config *Config) (filters.Filter, error) {
 				KeepAlive:                     true,
 			},
 			DialAddr:              md.DialQuic,
-			KeepAliveTimeout:      5 * time.Minute,
+			KeepAliveTimeout:      2 * time.Minute,
+			IdleConnTimeout:       time.Duration(config.Transport.IdleConnTimeout) * time.Second,
 			ResponseHeaderTimeout: time.Duration(config.Transport.ResponseHeaderTimeout) * time.Second,
 			GetClientKey:          GetHostnameCacheKey,
 		}
@@ -297,7 +319,7 @@ func NewFilter(config *Config) (filters.Filter, error) {
 		tr.RoundTripper = &http2.Transport{
 			DialTLS:            md.DialTLS2,
 			TLSClientConfig:    md.GoogleTLSConfig,
-			DisableCompression: config.Transport.DisableCompression,
+			DisableCompression: true,
 		}
 	case !config.DisableHTTP2:
 		err := http2.ConfigureTransport(t1)
@@ -369,28 +391,19 @@ func NewFilter(config *Config) (filters.Filter, error) {
 				return
 			}
 
-			c := make(chan error)
+			req, _ := http.NewRequest(http.MethodGet, "https://clients3.google.com/generate_204", nil)
+			resp, err := tr.RoundTrip(req)
+			if resp != nil && resp.Body != nil {
+				resp.Body.Close()
+			}
 
-			go func(c chan<- error) {
-				req, _ := http.NewRequest(http.MethodGet, "https://clients3.google.com/generate_204", nil)
-				resp, err := tr.RoundTrip(req)
-				c <- err
-				if resp != nil && resp.Body != nil {
-					resp.Body.Close()
-				}
-			}(c)
-
-			select {
-			case err := <-c:
+			if err != nil {
 				if te, ok := err.(interface {
 					Timeout() bool
 				}); ok && te.Timeout() {
 					glog.V(2).Infof("GAE EnableDeadProbe probeQuic error: %v", te)
 					helpers.CloseConnections(tr.RoundTripper)
 				}
-			case <-time.After(2 * time.Second):
-				glog.V(2).Infof("GAE EnableDeadProbe probeQuic timed out. Close all quic connections")
-				helpers.CloseConnections(tr.RoundTripper)
 			}
 
 		}
@@ -409,17 +422,37 @@ func NewFilter(config *Config) (filters.Filter, error) {
 		}()
 	}
 
-	helpers.ShuffleStrings(config.AppIDs)
+	if len(config.AppIDs) > 0 && len(config.CustomDomains) > 0 {
+		glog.Fatalf("GAE AppIDs and CustomDomains is conflict!")
+	}
+
+	urls := []url.URL{}
+	for _, s := range config.AppIDs {
+		urls = append(urls, url.URL{
+			Scheme: "https",
+			Host:   s + ".appspot.com",
+			Path:   "/_gh/"})
+	}
+	for _, s := range config.CustomDomains {
+		urls = append(urls, url.URL{
+			Scheme: "https",
+			Host:   s,
+			Path:   "/_gh/"})
+	}
+	rand.Shuffle(len(urls), func(i int, j int) {
+		urls[i], urls[j] = urls[j], urls[i]
+	})
 
 	f := &Filter{
 		Config: *config,
 		GAETransport: &GAETransport{
 			Transport:   tr,
 			MultiDialer: md,
-			Servers:     NewServers(config.AppIDs, config.Password, config.SSLVerify),
+			Servers:     NewServers(urls, config.Password, config.SSLVerify),
 			Deadline:    time.Duration(config.Transport.ResponseHeaderTimeout-2) * time.Second,
 			RetryDelay:  time.Duration(config.Transport.RetryDelay*1000) * time.Millisecond,
 			RetryTimes:  config.Transport.RetryTimes,
+			BrotliSites: helpers.NewHostMatcher(config.ForceBrotli),
 		},
 		Transport:          tr,
 		ForceHTTPSMatcher:  helpers.NewHostMatcher(forceHTTPSMatcherStrings),
@@ -568,6 +601,16 @@ func (f *Filter) RoundTrip(ctx context.Context, req *http.Request) (context.Cont
 	if resp != nil && resp.Header != nil {
 		resp.Header.Del("Alt-Svc")
 		resp.Header.Del("Alternate-Protocol")
+		if resp.Header.Get("Content-Encoding") == "br" && !strings.Contains(resp.Request.Header.Get("Accept-Encoding"), "br") {
+			r, err := brotli.NewReader(resp.Body, nil)
+			if err != nil {
+				return ctx, nil, err
+			}
+			resp.Body = helpers.ReaderCloser{Reader: r, Closer: resp.Body}
+			resp.Header.Del("Content-Encoding")
+			resp.Header.Del("Content-Length")
+			resp.ContentLength = -1
+		}
 	}
 
 	glog.V(2).Infof("%s \"GAE %s %s %s %s\" %d %s", req.RemoteAddr, prefix, req.Method, req.URL.String(), req.Proto, resp.StatusCode, resp.Header.Get("Content-Length"))
